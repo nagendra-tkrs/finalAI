@@ -400,16 +400,30 @@ export default function CompanyDetail() {
     try {
       const res = await api.post(`/companies/${companyId}/contacts/discover`, null, { timeout: 300000 });
       const list = res.data?.data || res.data || [];
-      if (Array.isArray(list)) {
+      const searchDiag = res.data?.searchDiagnostics;
+      if (Array.isArray(list) && list.length > 0) {
         setContacts(list);
         const lead = list.find(c => c.roleCategory !== 'general' && c.seniority !== 'general') || list[0];
         if (lead) {
           setSelectedContactId(lead._id);
         }
+        await fetchPatternInfo();
+        setSuccessMsg(`Discovered ${list.length} decision maker${list.length > 1 ? 's' : ''} and corporate channels.`);
+        setTimeout(() => setSuccessMsg(''), 4000);
+      } else {
+        if (Array.isArray(list)) {
+          setContacts([]);
+        }
+        await fetchPatternInfo();
+        if (searchDiag && searchDiag.isConfigured === false) {
+          setError(`Search service unavailable (${searchDiag.reason || 'provider not configured'}). No contacts were found.`);
+        } else if (searchDiag && searchDiag.reason && searchDiag.reason !== 'READY') {
+          setError(`Search partially unavailable (${searchDiag.reason}). No contacts were found.`);
+        } else {
+          setSuccessMsg('Search completed, but no public decision-maker profiles were found.');
+          setTimeout(() => setSuccessMsg(''), 4000);
+        }
       }
-      await fetchPatternInfo();
-      setSuccessMsg('Decision makers and corporate channels discovered successfully!');
-      setTimeout(() => setSuccessMsg(''), 4000);
     } catch (err) {
       setError(`Contact extraction failed: ${err.message}`);
     } finally {

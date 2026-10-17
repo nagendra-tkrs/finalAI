@@ -18,7 +18,14 @@ from app.services.decision_maker_engine import (
     is_valid_decision_maker,
     is_strict_person_name,
     decode_cloudflare_email,
+    search_duckduckgo_multi_round,
+    dedupe_candidates,
+    validate_all_candidates,
+    rank_candidates_with_ollama,
+    final_safety_filter,
 )
+from app.services.email_discovery_service import discover_decision_maker_emails
+from app.services.email_validation_service import is_valid_email_format
 from app.services.web_search_service import (
     clean_executive,
     fetch_authoritative_public_records,
@@ -727,7 +734,9 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
             '/leadership-team', '/management', '/board', '/board-of-directors',
             '/directors', '/executives', '/executive-team', '/people',
             '/contact', '/contact-us', '/investor', '/investors',
-            '/corporate', '/governance', '/company/leadership-team'
+            '/corporate', '/governance', '/company/leadership-team',
+            '/impressum', '/impressum/', '/de/impressum', '/de/impressum/',
+            '/legal', '/legal-notice', '/imprint', '/company/team', '/about/team'
         ]
         discovered_urls = []
         fetched_urls = set()
@@ -741,30 +750,45 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
                     fetched_urls.add(u)
                     resp = await client.get(u, headers=headers, follow_redirects=True)
                     if resp.status_code == 200 and len(resp.text) > 200:
-                        pages.append({'url': str(resp.url), 'html': resp.text, 'content': resp.text, 'pageType': 'leadership'})
-                        # Extract internal leadership links from page
+                        is_legal = any(k in str(resp.url).lower() for k in ['impressum', 'legal', 'imprint'])
+                        pages.append({'url': str(resp.url), 'html': resp.text, 'content': resp.text, 'pageType': 'impressum' if is_legal else 'leadership'})
+                        
+                        # Extract internal leadership and footer links from page
                         soup = BeautifulSoup(resp.text, 'html.parser')
-                        for a in soup.find_all('a', href=True):
+                        
+                        # Search all links, giving special priority to footer elements
+                        footer_links = []
+                        for footer_el in soup.find_all(['footer', 'div', 'section'], class_=re.compile(r'footer', re.I)) + soup.find_all(['footer', 'div', 'section'], id=re.compile(r'footer', re.I)):
+                            for a in footer_el.find_all('a', href=True):
+                                footer_links.append(a)
+                        
+                        all_candidate_links = footer_links + soup.find_all('a', href=True)
+                        for a in all_candidate_links:
                             href = a['href']
                             full_url = urljoin(str(resp.url), href)
                             if urlparse(full_url).netloc.lower().replace('www.', '') == clean_domain:
                                 link_text = (a.get_text() or '').lower()
                                 link_href = href.lower()
-                                if any(k in link_href or k in link_text for k in ['leadership', 'board', 'director', 'team', 'management', 'executive', 'governance']):
+                                high_priority_keywords = ['impressum', 'imprint', 'legal', 'geschaeftsfuehrer', 'leadership', 'board', 'director', 'team', 'management', 'executive', 'governance', 'about-us', 'our-team', 'people', 'founder']
+                                if any(k in link_href or k in link_text for k in high_priority_keywords):
                                     if full_url not in fetched_urls and full_url not in discovered_urls:
-                                        discovered_urls.append(full_url)
+                                        if any(k in link_href or k in link_text for k in ['impressum', 'legal', 'leadership', 'board', 'director', 'management', 'team']):
+                                            discovered_urls.insert(0, full_url)
+                                        else:
+                                            discovered_urls.append(full_url)
                 except Exception:
                     pass
 
-            # Fetch up to 6 dynamically discovered internal leadership links
-            for du in discovered_urls[:6]:
+            # Fetch up to 8 dynamically discovered internal leadership/legal links
+            for du in discovered_urls[:8]:
                 if du in fetched_urls:
                     continue
                 fetched_urls.add(du)
                 try:
                     resp = await client.get(du, headers=headers, follow_redirects=True)
                     if resp.status_code == 200 and len(resp.text) > 200:
-                        pages.append({'url': str(resp.url), 'html': resp.text, 'content': resp.text, 'pageType': 'leadership'})
+                        is_legal = any(k in str(resp.url).lower() for k in ['impressum', 'legal', 'imprint'])
+                        pages.append({'url': str(resp.url), 'html': resp.text, 'content': resp.text, 'pageType': 'impressum' if is_legal else 'leadership'})
                 except Exception:
                     pass
 
@@ -820,15 +844,26 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
     mx_status = mx_check.get('mxStatus', 'UNKNOWN')
 
     # Phase 2 Email Discovery & Pattern Detection
-    if enable_phase2 and candidates:
-        candidates = await discover_phase2_decision_maker_emails(
-            candidates=candidates,
-            company_name=company_name,
-            website=raw_website,
-            crawled_pages=pages,
-            direct_emails=direct_signals.get('emails', []),
-            mx_status=mx_status
-        )
+    if enable_phase2:
+        if not candidates:
+            # Phase 1 found zero candidates on official crawled pages.
+            # Perform external public web discovery to find decision makers:
+            external_candidates = search_duckduckgo_multi_round(company_name, raw_website, [], target=6)
+            deduped_ext = dedupe_candidates(external_candidates)
+            valid_ext = validate_all_candidates(deduped_ext, company_name, raw_website)
+            if valid_ext:
+                ranked_ext = rank_candidates_with_ollama(valid_ext, company_name, 6)
+                candidates = final_safety_filter(ranked_ext, company_name, raw_website, 6)
+
+        if candidates:
+            candidates = await discover_decision_maker_emails(
+                candidates=candidates,
+                company_name=company_name,
+                website=raw_website,
+                crawled_pages=pages,
+                direct_emails=direct_signals.get('emails', []),
+                mx_status=mx_status
+            )
 
     research = await db.companyresearches.find_one({"companyId": cid}) or {}
     now = datetime.now(timezone.utc)
@@ -853,7 +888,7 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
         exact_email = c.get('exact_email')
         if not exact_email and (c.get('email_status') == 'EXACT_FOUND' or c.get('emailStatus') == 'EXACT_FOUND' or c.get('isExactPublished')):
             exact_email = c.get('email')
-        if exact_email and isinstance(exact_email, str):
+        if exact_email and isinstance(exact_email, str) and is_valid_email_format(exact_email):
             exact_email = exact_email.strip()
         else:
             exact_email = None
@@ -861,21 +896,41 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
         generated_email = None
         if not exact_email:
             if c.get('email_status') == 'PATTERN_GENERATED' or c.get('emailStatus') == 'PATTERN_GENERATED' or c.get('email_verification') == 'PATTERN_INFERENCE':
-                generated_email = c.get('email')
-                if generated_email and isinstance(generated_email, str):
-                    generated_email = generated_email.strip()
+                cand_gen = c.get('email')
+                if cand_gen and isinstance(cand_gen, str) and is_valid_email_format(cand_gen):
+                    generated_email = cand_gen.strip()
                 else:
                     generated_email = None
 
         if exact_email:
-            final_email = exact_email
-            email_status = 'EXACT_FOUND'
-            status = 'verified'
-            is_exact = True
-            mailbox_verification = 'UNVERIFIED'
-            verification_method = 'PUBLIC_EVIDENCE'
-            conf_score = 96
-            gen_pattern = 'none'
+            # Phase 3 requirement: Store a source URL and supporting evidence for every email marked EXACT_FOUND.
+            # If evidence is missing, do not mark it EXACT_FOUND.
+            evidence_snippet = c.get('email_evidence') or c.get('evidence') or ''
+            has_source_url = bool(source_url and str(source_url).strip() and str(source_url).strip() != 'about:blank')
+            has_valid_evidence = bool(
+                (isinstance(evidence_snippet, str) and len(evidence_snippet.strip()) >= 5) or
+                (isinstance(evidence_snippet, dict) and bool(evidence_snippet))
+            )
+
+            if has_source_url and has_valid_evidence:
+                final_email = exact_email
+                email_status = 'EXACT_FOUND'
+                status = 'verified'
+                is_exact = True
+                mailbox_verification = 'UNVERIFIED'
+                verification_method = 'PUBLIC_EVIDENCE'
+                conf_score = 96
+                gen_pattern = 'none'
+            else:
+                final_email = exact_email
+                email_status = 'NEEDS_REVIEW'
+                status = 'needs_review'
+                is_exact = False
+                mailbox_verification = 'UNVERIFIED'
+                verification_method = 'INSUFFICIENT_EVIDENCE'
+                conf_score = 60
+                gen_pattern = 'none'
+                c['email_reason'] = 'Email found but lacks supporting source URL or evidence snippet'
         elif generated_email:
             final_email = generated_email
             email_status = 'PATTERN_GENERATED'
@@ -974,6 +1029,9 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
         imported_name = company.get('contactName').strip()
         if is_strict_person_name(imported_name, company_name):
             role_info = categorize_role('Executive Leadership')
+            raw_imported_email = company.get('contactEmail')
+            imported_email = raw_imported_email.strip() if (raw_imported_email and isinstance(raw_imported_email, str) and is_valid_email_format(raw_imported_email)) else None
+            has_imported_email = bool(imported_email)
             discovered.append({
                 'companyId': cid,
                 'name': imported_name,
@@ -984,29 +1042,29 @@ async def extract_contacts_from_website(company_id: str, return_diagnostics: boo
                 'roleCategory': role_info['roleCategory'],
                 'seniority': role_info['seniority'],
                 'department': 'Executive',
-                'email': company.get('contactEmail') or None,
+                'email': imported_email,
                 'emailDomain': clean_domain,
-                'emailStatus': 'EXACT_FOUND' if company.get('contactEmail') else 'NOT_FOUND',
-                'status': 'verified' if company.get('contactEmail') else 'not_found',
+                'emailStatus': 'EXACT_FOUND' if has_imported_email else 'NOT_FOUND',
+                'status': 'verified' if has_imported_email else 'not_found',
                 'mailboxVerification': 'UNVERIFIED',
-                'emailVerificationMethod': 'Direct Input' if company.get('contactEmail') else 'NONE',
-                'isExactPublished': bool(company.get('contactEmail')),
+                'emailVerificationMethod': 'Direct Input' if has_imported_email else 'NONE',
+                'isExactPublished': has_imported_email,
                 'source': 'Imported Record',
                 'sourceType': 'excel_import',
                 'evidenceTier': 'tier1',
                 'sourceUrl': raw_website,
                 'isCurrentRole': 'confirmed_current',
-                'confidenceScore': 90,
+                'confidenceScore': 90 if has_imported_email else 50,
                 'evidence': {
                     'personEvidence': f"{imported_name} listed in company profile records",
                     'roleEvidence': 'Executive Leadership',
-                    'emailEvidence': company.get('contactEmail') or '',
+                    'emailEvidence': imported_email or '',
                     'snippet': imported_name
                 },
                 'patternUsed': 'none',
                 'patternConfidence': 'none',
-                'patternExamples': [company.get('contactEmail')] if company.get('contactEmail') else [],
-                'patternSources': ['Imported Record'],
+                'patternExamples': [imported_email] if imported_email else [],
+                'patternSources': ['Imported Record'] if imported_email else [],
                 'mxStatus': mx_check.get('mxStatus', 'UNKNOWN'),
                 'mxProvider': mx_check.get('mxProvider', ''),
                 'decisionMakerStatus': 'VERIFIED',

@@ -7,7 +7,8 @@ RULES = [
                 r'/team', r'/our-team', r'/leadership', r'/management', r'/board',
                 r'/people', r'/executives', r'/founders', r'/advisors', r'/staff',
                 r'/who-we-are/leadership', r'/company/team', r'/about/team',
-                r'/about-us/leadership', r'/meet-the-team', r'/bio/', r'/profile/'
+                r'/about-us/leadership', r'/meet-the-team', r'/bio/', r'/profile/',
+                r'/impressum', r'/imprint', r'/legal-notice', r'/gesetzliche-angaben'
             ]
         ],
         'type': 'leadership'

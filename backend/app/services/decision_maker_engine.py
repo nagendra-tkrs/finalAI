@@ -14,8 +14,9 @@ try:
 except ImportError:
     HAS_DDGS = False
 
-from app.services.search.public_web_search_provider import is_circuit_open, trip_circuit
-from app.services.email_validation_service import canonical_person_email_match
+from app.services.search.public_web_search_provider import is_circuit_open, trip_circuit, reset_circuit
+from app.services.search_service import decode_redirect_url, is_challenge_or_blocked_page
+from app.services.email_validation_service import canonical_person_email_match, is_valid_email_format
 
 # ============================================================
 # CONFIGURATION
@@ -243,7 +244,15 @@ ROLE_PATTERNS = [
     ),
     (
         "Managing Director",
-        r"\bManaging\s+Director\b",
+        r"\b(?:Managing\s+Director|Geschäftsführer(?:in)?|Geschaeftsfuehrer(?:in)?|Geschäftsführung|Geschaeftsfuehrung)\b",
+    ),
+    (
+        "Managing Partner",
+        r"\bManaging\s+Partner\b",
+    ),
+    (
+        "Executive Board",
+        r"\b(?:Vorstandsvorsitzende[rn]?|Vorstand|Executive\s+Board)\b",
     ),
     (
         "Founder",
@@ -255,7 +264,7 @@ ROLE_PATTERNS = [
     ),
     (
         "Owner",
-        r"\bOwner\b",
+        r"\b(?:Owner|Co-Owner|Inhaber(?:in)?)\b",
     ),
     (
         "CEO",
@@ -501,6 +510,24 @@ def company_tokens(company_name):
 # ENTITY & NAME VALIDATION
 # ============================================================
 
+GEOGRAPHIC_TERMS = {
+    "altona", "zealand", "australia", "america", "africa", "asia", "europe",
+    "canada", "ireland", "kingdom", "singapore", "delhi", "mumbai",
+    "melbourne", "sydney", "auckland", "wellington", "london", "dublin",
+    "california", "texas", "florida", "district", "province", "county",
+    "suburb", "suburbs", "depot", "terminal", "airport", "harbor", "harbour"
+}
+
+DIRECTIONAL_TERMS = {"north", "south", "east", "west", "central", "coastal", "regional"}
+
+ASSET_DOCUMENT_TERMS = {
+    "media", "kit", "press", "brand", "sheet", "paper", "manual", "guide",
+    "policy", "terms", "conditions", "newsroom", "assets", "resource", "resources",
+    "center", "centre", "portal", "download", "downloads", "brochure", "catalog", "catalogue", "pricing",
+    "plans", "faq", "faqs", "case", "study", "studies", "article", "articles",
+    "podcast", "webinar", "overview", "release"
+}
+
 def looks_like_organization_name(name, company_name=""):
     raw = normalize_text(name).lower()
     if not raw:
@@ -524,13 +551,18 @@ def looks_like_organization_name(name, company_name=""):
             if any(t in ORGANIZATION_TERMS for t in raw_tokens) or any(t in BAD_NAME_WORDS for t in raw_tokens):
                 return True
 
-    # 2. Known organizational committees & departments
+    # 2. Known organizational committees, departments & non-person labels
     company_like_phrases = [
         "innovation projects", "management team", "leadership team",
         "executive team", "executive committee", "advisory board",
         "board committee", "csr committee", "audit committee",
         "nomination committee", "risk committee", "board of directors",
-        "investor relations", "contact us", "customer care", "customer service"
+        "investor relations", "contact us", "customer care", "customer service",
+        "media kit", "press kit", "brand kit", "fact sheet", "white paper",
+        "case study", "case studies", "terms of service", "privacy policy",
+        "terms of use", "cookie policy", "terms and conditions", "press release",
+        "news release", "all rights reserved", "rights reserved", "new zealand",
+        "united states", "united kingdom", "south africa", "altona north",
     ]
     if any(phrase in raw for phrase in company_like_phrases):
         return True
@@ -543,8 +575,30 @@ def looks_like_organization_name(name, company_name=""):
     if any(token in ORGANIZATION_TERMS for token in tokens):
         return True
 
-    # 4. If all tokens are bad/non-person name words
-    bad_count = sum(1 for token in tokens if token in BAD_NAME_WORDS)
+    # 4. Location + Directional check (e.g. Altona North, Sydney West)
+    has_geo = any(t in GEOGRAPHIC_TERMS for t in tokens)
+    has_dir = any(t in DIRECTIONAL_TERMS for t in tokens)
+    if has_geo and has_dir:
+        return True
+
+    # 5. Multi-asset noun check (e.g. Media Kit, Fact Sheet, Case Study, White Paper)
+    asset_count = sum(1 for t in tokens if t in ASSET_DOCUMENT_TERMS)
+    if asset_count >= 2:
+        return True
+
+    # 6. Prefix + Location (e.g. New Zealand, United States, South Africa)
+    if len(tokens) >= 2 and tokens[0] in {"new", "united", "south", "north", "east", "west", "central"} and any(t in GEOGRAPHIC_TERMS for t in tokens[1:]):
+        return True
+
+    # 7. If all tokens are non-person name words
+    bad_count = sum(
+        1 for token in tokens
+        if token in BAD_NAME_WORDS
+        or token in ORGANIZATION_TERMS
+        or token in GEOGRAPHIC_TERMS
+        or token in DIRECTIONAL_TERMS
+        or token in ASSET_DOCUMENT_TERMS
+    )
     if bad_count >= len(tokens):
         return True
 
@@ -561,6 +615,12 @@ def is_strict_person_name(name, company_name=""):
     tokens = name.split()
     if not (2 <= len(tokens) <= 5):
         return False
+
+    # First token must be a valid given name (at least 2 chars, or initial with period)
+    first_token = tokens[0].strip(".,'-")
+    if len(first_token) < 2 and not re.fullmatch(r"[A-Za-z]\.", tokens[0]):
+        return False
+
     # Ensure last name is at least 2 characters (reject single letters like 'L' or 'S')
     last_token = tokens[-1].strip(".,'-")
     if len(last_token) < 2:
@@ -595,7 +655,8 @@ def is_strict_person_name(name, company_name=""):
         "has featured", "featured ms", "featured mr", "view more",
         "read more", "click here", "story of", "storyboard", "latest news",
         "chief executive officer", "managing director", "board of",
-        "management team", "leadership team", "company profile", "contact us"
+        "management team", "leadership team", "company profile", "contact us",
+        "media kit", "press kit", "white paper", "case study", "fact sheet"
     ]
     if any(phrase in lower for phrase in forbidden):
         return False
@@ -710,6 +771,46 @@ def role_attached_to_other_company(evidence, company_name):
     target_tokens = set(company_tokens(company_name))
     brand = clean_brand_name(company_name).lower()
     first_brand_word = brand.split()[0] if brand.split() else ""
+
+    # Check 1: Explicit delimiter parsing (pipe, slash, dash, at, for, of, comma)
+    # Matches: Role [|,–—\/-] ExternalCompany (e.g. "Owner | Fris Karton", "Co-Owner | Dücker Prefeeder")
+    sep_pattern = re.compile(
+        r"\b(?:co-founder|founder|owner|co-owner|ceo|chief executive officer|managing director|managing partner|partner|director|chairman|president|cto|cfo|coo|cio|chief technology officer|chief operating officer|chief financial officer|chief information officer|head of [a-z]+|vice president|vp)\b\s*"
+        r"(?:[|/–—\-]|\s+(?:of|at|for)\s+)\s*"
+        r"([^\W\d_][\w &.,'-]{1,60}?)"
+        r"(?:\s*[\"“„'”\n]|,\s*|\s*\(|$)",
+        re.I | re.UNICODE
+    )
+    for match in sep_pattern.finditer(evidence):
+        company_context = normalize_text(match.group(1)).strip()
+        if not company_context:
+            continue
+        context_tokens = set(re.findall(r"[a-z0-9]+", company_context.lower()))
+        # If the matched token is the target company itself, it is NOT an external company
+        if first_brand_word and len(first_brand_word) >= 3 and first_brand_word in context_tokens:
+            continue
+        meaningful_target = {
+            token for token in target_tokens
+            if token not in {"limited", "ltd", "private", "pvt", "public", "company", "corporation", "corp", "inc", "group", "holdings", "industries"}
+        }
+        if meaningful_target and any(t in context_tokens for t in meaningful_target):
+            continue
+        # Context tokens represent an external company
+        if len(context_tokens) >= 1:
+            return True
+
+    # Check 2: Customer / Partner testimonial quote detection
+    # Quotes praising the target company or its products indicate a client or partner speaker
+    quote_markers = [
+        r"[„“\"](?:by combining our expertise|with our|that we installed|our customers|the celluveyor|offers our customers|together with|in our experience|working with|installed in the year|impressed me|gave us)\b",
+        r"\b(?:case\s+study|success\s+story|client\s+story|customer\s+review|testimonial)\b",
+    ]
+    for qm in quote_markers:
+        if re.search(qm, lower):
+            if re.search(r"\b(?:owner|co-owner|director|managing director|partner|co-founder)\s*[|/–—\-]", lower):
+                return True
+
+    # Check 3: Standard corporate patterns
     patterns = [
         r"\b(?:founder|co-founder|owner|ceo|chief executive officer|managing director|director|chairman)\b\s*(?:,|\s+(?:of|at|for)\s+)\s*([A-Za-z][A-Za-z0-9& .,'-]{2,100})",
         r"\b(?:founder|co-founder)\s+(?:of|at)\s+([A-Za-z][A-Za-z0-9& .,'-]{2,100})",
@@ -1190,10 +1291,50 @@ def extract_image_caption_candidates(soup, source_url, company_name):
 
     return candidates
 
+def extract_impressum_candidates(text, source_url, company_name, diagnostics=None):
+    """Specialized extractor for German / European Impressum and Legal Notice disclosures."""
+    candidates = []
+    if not text:
+        return candidates
+
+    role_pattern = re.compile(
+        r"\b(Geschäftsführer(?:in)?|Geschaeftsfuehrer(?:in)?|Geschäftsführung|Vorstand|Managing\s+Director|Inhaber(?:in)?|Director[s]?)\b[:\s]+([^\n\r]+)",
+        re.I
+    )
+    academic_prefixes = r"\b(?:Dr\.-Ing\.|Dipl\.-Ing\.|Dr\.|Prof\.|Dipl\.-Kfm\.|Dipl\.-Wirt\.-Ing\.|Mr\.|Mrs\.|Ms\.)\s*"
+    matches = role_pattern.finditer(text)
+    for m in matches:
+        raw_role = m.group(1).strip()
+        names_blob = m.group(2).strip()
+        role = "Managing Director" if re.search(r"Geschäftsführer|Geschaeftsfuehrer|Geschäftsführung|Managing\s+Director", raw_role, re.I) else (
+            "Executive Board" if re.search(r"Vorstand", raw_role, re.I) else "Owner"
+        )
+        parts = re.split(r"\s+(?:und|and|&)\s+|,\s*", names_blob)
+        for part in parts:
+            clean = re.sub(academic_prefixes, "", part, flags=re.I).strip()
+            clean = re.split(r"(?:\s+(?:Kleiner|Straße|Str\.|Weg|Platz|Deutschland|Germany|\d{4,5}|Telefon|Tel\.|E-Mail|Email))\b", clean)[0].strip()
+            words = clean.split()
+            if len(words) >= 2 and all(w[0].isupper() for w in words[:2]):
+                cand_name = " ".join(words[:3])
+                if is_strict_person_name(cand_name, company_name):
+                    candidates.append({
+                        "name": normalize_name(cand_name),
+                        "role": role,
+                        "evidence": f"Official legal notice ({source_url}): {m.group(0)[:250]}",
+                        "source_type": "official_website",
+                        "source_url": source_url
+                    })
+    return candidates
+
 def extract_official_candidates(html_content, source_url, company_name, diagnostics=None):
     candidates = []
     if not html_content:
         return candidates
+
+    # 0. Specialized Impressum / Legal Notice extraction
+    if any(k in source_url.lower() or k in html_content[:4000].lower() for k in ["impressum", "imprint", "legal-notice", "gesetzliche anbieterkennung"]):
+        page_clean = clean_html_text(html_content)
+        candidates.extend(extract_impressum_candidates(page_clean, source_url, company_name, diagnostics))
 
     # 1. JSON-LD structured data extraction
     candidates.extend(extract_json_ld_candidates(html_content, source_url, company_name))
@@ -1238,52 +1379,90 @@ def extract_official_candidates(html_content, source_url, company_name, diagnost
 # ============================================================
 
 LAST_DDG_SEARCH_FAILED = False
+LAST_DDG_SEARCH_STATUS = "OK"
 
 def ddg_search(query, max_results=MAX_DDG_RESULTS, retries=DDG_RETRIES):
-    global LAST_DDG_SEARCH_FAILED
+    global LAST_DDG_SEARCH_FAILED, LAST_DDG_SEARCH_STATUS
     LAST_DDG_SEARCH_FAILED = False
+    LAST_DDG_SEARCH_STATUS = "OK"
 
     # DuckDuckGo is the ONLY external search provider. No other search engines are used.
-    if not is_circuit_open():
-        if HAS_DDGS:
-            try:
-                results = []
-                with DDGS(timeout=2.5) as ddgs:
-                    for item in ddgs.text(query, max_results=max_results):
-                        results.append(item)
-                if results:
-                    LAST_DDG_SEARCH_FAILED = False
-                    return results
-            except Exception:
-                pass
+    if is_circuit_open():
+        LAST_DDG_SEARCH_FAILED = True
+        LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+        return None
 
-        # Fallback to direct HTTP search on DuckDuckGo
+    if HAS_DDGS:
         try:
-            url = "https://html.duckduckgo.com/html/"
-            headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-            with httpx.Client(verify=False, timeout=3.0) as client:
-                res = client.get(url, params={"q": query}, headers=headers)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.text, "html.parser")
-                    bodies = soup.find_all("div", class_=re.compile(r"result__body"))
-                    results = []
-                    for b in bodies[:max_results]:
-                        a_title = b.find("a", class_=re.compile(r"result__a"))
-                        a_snip = b.find("a", class_=re.compile(r"result__snippet"))
-                        if a_title:
-                            results.append({
-                                "title": a_title.get_text().strip(),
-                                "href": a_title.get("href", ""),
-                                "body": a_snip.get_text().strip() if a_snip else ""
-                            })
-                    if results:
-                        LAST_DDG_SEARCH_FAILED = False
-                        return results
-        except Exception:
-            pass
+            results = []
+            with DDGS(timeout=2.5) as ddgs:
+                for item in ddgs.text(query, max_results=max_results):
+                    raw_href = item.get("href", "")
+                    if raw_href:
+                        item["href"] = decode_redirect_url(raw_href)
+                    results.append(item)
+            LAST_DDG_SEARCH_FAILED = False
+            LAST_DDG_SEARCH_STATUS = "OK"
+            return results
+        except Exception as e:
+            err_str = str(e).lower()
+            if "timeout" in err_str:
+                LAST_DDG_SEARCH_STATUS = "SEARCH_TIMEOUT"
+            else:
+                LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+
+    # Fallback to direct HTTP search on DuckDuckGo
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+        with httpx.Client(verify=False, timeout=3.0) as client:
+            res = client.get(url, params={"q": query}, headers=headers)
+            if res.status_code == 200:
+                html_text = res.text
+                if is_challenge_or_blocked_page(html_text):
+                    LAST_DDG_SEARCH_FAILED = True
+                    LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+                    trip_circuit(60.0)
+                    return None
+                soup = BeautifulSoup(html_text, "html.parser")
+                bodies = soup.find_all("div", class_=re.compile(r"result__body"))
+                results = []
+                for b in bodies[:max_results]:
+                    a_title = b.find("a", class_=re.compile(r"result__a"))
+                    a_snip = b.find("a", class_=re.compile(r"result__snippet"))
+                    if a_title:
+                        raw_href = a_title.get("href", "")
+                        clean_link = decode_redirect_url(raw_href)
+                        results.append({
+                            "title": a_title.get_text().strip(),
+                            "href": clean_link,
+                            "body": a_snip.get_text().strip() if a_snip else ""
+                        })
+                LAST_DDG_SEARCH_FAILED = False
+                LAST_DDG_SEARCH_STATUS = "OK"
+                return results
+            elif res.status_code in (202, 403, 429) or "anomaly" in res.text[:5000].lower():
+                LAST_DDG_SEARCH_FAILED = True
+                LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+                trip_circuit(60.0)
+                return None
+            else:
+                LAST_DDG_SEARCH_FAILED = True
+                LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+                return None
+    except httpx.TimeoutException:
+        LAST_DDG_SEARCH_FAILED = True
+        LAST_DDG_SEARCH_STATUS = "SEARCH_TIMEOUT"
+        return None
+    except Exception:
+        LAST_DDG_SEARCH_FAILED = True
+        LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+        return None
 
     LAST_DDG_SEARCH_FAILED = True
-    return []
+    if LAST_DDG_SEARCH_STATUS == "OK":
+        LAST_DDG_SEARCH_STATUS = "SEARCH_UNAVAILABLE"
+    return None
 
 def company_relevant(text, company_name, website, source_url=""):
     combined = normalize_text(f"{text} {source_url}").lower()
@@ -1345,7 +1524,7 @@ def search_duckduckgo_multi_round(company_name, website, existing_candidates, ta
     queries = build_ddg_queries(company_name, website)
     for query in queries:
         results = ddg_search(query, MAX_DDG_RESULTS)
-        extracted = extract_ddg_candidates(results, company_name, website)
+        extracted = extract_ddg_candidates(results or [], company_name, website)
         all_candidates.extend(extracted)
         deduped = dedupe_candidates(all_candidates)
         if len(deduped) >= target * 2:
@@ -1934,13 +2113,14 @@ def search_ddg_exact_person_email(person_name, company_name, domain, allowed_dom
                     print(f"[TARGET CRAWL] Failed crawling {href}: {crawl_err}")
 
     if any_timeout and not any_success:
+        failure_status = "SEARCH_TIMEOUT"
         print(f"[SEARCH] DDG timeout/failure for all attempted queries")
-        print(f"[SEARCH] status=SEARCH_TIMEOUT")
+        print(f"[SEARCH] status={failure_status}")
         print(f"[EMAIL] NOT_FOUND not assigned because discovery was incomplete")
         return {
             "email": None,
-            "status": "SEARCH_TIMEOUT",
-            "search_status": "SEARCH_TIMEOUT",
+            "status": failure_status,
+            "search_status": failure_status,
             "search_attempts": attempts,
             "sources_checked": sources_checked,
             "search_error": "All public search queries timed out",
@@ -2310,7 +2490,8 @@ async def discover_phase2_decision_maker_emails(
         else:
             item["email"] = None
             item["exact_email"] = None
-            item["email_status"] = cand_search_status if cand_search_status in ("SEARCH_TIMEOUT", "SEARCH_UNAVAILABLE") else "NOT_FOUND"
+            fail_st = cand_search_status if cand_search_status in ("SEARCH_TIMEOUT", "SEARCH_UNAVAILABLE") else "NOT_FOUND"
+            item["email_status"] = fail_st
             item["emailStatus"] = "NOT_FOUND"
             item["email_source_url"] = ""
             item["email_source_type"] = "NONE"

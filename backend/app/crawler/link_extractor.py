@@ -12,7 +12,8 @@ LEADERSHIP_KEYWORDS = [
     'investor relations', 'investors', 'investor', 'annual report', 'management discussion',
     'corporate profile', 'corporate', 'contact', 'contact-us', 'contact us',
     'careers', 'press', 'media', 'news', 'people', 'our-team', 'management-team',
-    'leadership-team', 'nodal', 'compliance', 'secretary', 'kmp'
+    'leadership-team', 'nodal', 'compliance', 'secretary', 'kmp',
+    'impressum', 'imprint', 'legal', 'legal-notice', 'gesetzliche-angaben'
 ]
 
 AVOID_PATTERNS = [
@@ -33,7 +34,9 @@ KNOWN_LEADERSHIP_PATHS = [
     '/executives', '/executive-team', '/corporate', '/investor',
     '/investors', '/contact', '/contact-us', '/investor/contacts',
     '/investors/contact', '/investor-relations', '/company',
-    '/company/team', '/company/leadership-team'
+    '/company/team', '/company/leadership-team',
+    '/impressum', '/impressum/', '/de/impressum', '/de/impressum/',
+    '/legal', '/legal-notice', '/imprint'
 ]
 
 def is_avoided_url(url: str) -> bool:

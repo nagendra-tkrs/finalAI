@@ -51,6 +51,43 @@ def normalize_text_token(tok: str) -> str:
     ascii_str = nfkd.encode("ASCII", "ignore").decode("utf-8")
     return re.sub(r"[^a-z0-9]", "", ascii_str.lower())
 
+INVALID_EMAIL_PLACEHOLDERS = {
+    "not publicly available",
+    "not publicly verified",
+    "not available",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "undefined",
+    "unknown",
+    "no email",
+    "pending",
+    "tbd"
+}
+
+def is_valid_email_format(email: str) -> bool:
+    """
+    Validates that a string is a well-formed email address and not a placeholder.
+    """
+    if not email or not isinstance(email, str):
+        return False
+    clean = email.strip().lower()
+    if clean in INVALID_EMAIL_PLACEHOLDERS:
+        return False
+    if " " in clean or "@" not in clean:
+        return False
+    parts = clean.split("@")
+    if len(parts) != 2:
+        return False
+    local, dom = parts[0], parts[1]
+    if not local or not dom or "." not in dom:
+        return False
+    if dom.startswith(".") or dom.endswith("."):
+        return False
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    return bool(re.match(pattern, clean))
+
 def is_generic_email(email: str) -> bool:
     if not email or "@" not in email:
         return True

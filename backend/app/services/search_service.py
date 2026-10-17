@@ -218,10 +218,10 @@ async def search_public_web(query: str, max_results: int = 5, timeout: float = N
                     params={"q": clean_query},
                     headers=headers
                 )
-                if res.status_code in (403, 429):
-                    trip_circuit(45.0)
+                if res.status_code in (202, 403, 429):
+                    trip_circuit(60.0)
                     last_status = "SEARCH_UNAVAILABLE"
-                    last_error = f"DuckDuckGo returned HTTP {res.status_code}"
+                    last_error = f"DuckDuckGo returned HTTP {res.status_code} challenge"
                     break
                 if res.status_code != 200:
                     last_status = "SEARCH_UNAVAILABLE"
